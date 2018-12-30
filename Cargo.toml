@@ -5,15 +5,12 @@ authors = ["iancormac84 <wilnathan@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-bytes = "*"
-failure = "*"
-futures = "0.1.25"
-http = "0.1.13"
-hyper = "0.12.13"
-hyper-tls = "0.3.1"
+futures-preview = { version = "0.3.0-alpha.11", features = ["tokio-compat","compat"] }
+futures-util-preview = "0.3.0-alpha.11"
+hyper = "0.12.19"
+hyper-tls = "0.3"
 kuchiki = "0.7.2"
-mime = "0.3.9"
+mime = "0.3.12"
 mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 native-tls = "*" 
-streamunordered = "*"
-url = "*"
+url = "1.7.2"
