@@ -45,15 +45,16 @@ impl Orchestrator {
     pub async fn crawl_urls(&self) {
         for url in &self.seed_urls[..] {
             let url: Url = url.parse().unwrap();
-            let mut visited_acquired = await!(self.visited.lock());
-            //TODO: What if the request failed? Maybe it would be better to process the
-            //result of the client call to know whether the URL is active, and then proceed
-            //accordingly. If the URL is dead, it needs to be removed from the list of seed
-            //URLs. If it seems to be alive, but the request failed for some reason, one
-            //may want to retry, so it shouldn't be removed from the list of seed URLs.
-            //Maybe it should be put in a 'to_retry' list?
             {
+                let mut visited_acquired = await!(self.visited.lock());
+                //TODO: What if the request failed? Maybe it would be better to process the
+                //result of the client call to know whether the URL is active, and then proceed
+                //accordingly. If the URL is dead, it needs to be removed from the list of seed
+                //URLs. If it seems to be alive, but the request failed for some reason, one
+                //may want to retry, so it shouldn't be removed from the list of seed URLs.
+                //Maybe it should be put in a 'to_retry' list?
                 visited_acquired.insert(url.clone());
+                println!("At the top, visited_acquired is {:?}", &visited_acquired);
             }
             let request = Request::builder()
                 .method("GET")
@@ -132,9 +133,12 @@ impl Orchestrator {
         let urls = await!(searcher.crawl_html());
         println!("urls is {} URLs long", urls.len());
 
-        let visited_acquired = await!(self.visited.lock());
-        println!("visited_acquired is {:?}", visited_acquired);
-        let to_send: Vec<Url> = urls.difference(&visited_acquired).cloned().collect();
+        let to_send: Vec<Url> = {
+            let visited_acquired = await!(self.visited.lock());
+            println!("visited_acquired is {:?}", &visited_acquired);
+            let to_send = urls.difference(&visited_acquired).cloned().collect();
+            to_send
+        };
         println!("to_send is {:?}", to_send);
         let mut to_visit_acquired = await!(self.to_visit.lock());
         for uri in to_send.into_iter() {
