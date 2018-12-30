@@ -153,7 +153,6 @@ impl UrlSearcher {
     pub async fn crawl_html(self) -> HashSet<Url> {
         let body = await!(self.data.into_body().concat2().compat()).unwrap();
         let body = str::from_utf8(&body[..]).unwrap();
-        println!("body is {}", body);
         let parser = kuchiki::parse_html().one(&body[..]);
         let link_selector = parser.select("a").unwrap();
         let mut urls = HashSet::new();
@@ -167,21 +166,21 @@ impl UrlSearcher {
                     }
                     Err(error) => {
                         println!("Ignoring uri error {:?}. Discarding uri {:?}.", error, url);
-                            continue;
+                        continue;
                     }
                     Ok(url) => {
                         let host = url.host_str();
-                            if let Some(host) = host {
-                                if host != &self.base_url[..] {
-                                    println!("Skipping {:?} because we're only interested in what's on the EAG website.", url);
-                                    continue;
-                                } else {
-                                    url
-                                }
-                            } else {
-                                println!("Skipping {:?} url because it has no host. Is that even supposed to be possible?", url);
+                        if let Some(host) = host {
+                            if host != &self.base_url[..] {
+                                println!("Skipping {:?} because we're only interested in what's on the EAG website.", url);
                                 continue;
+                            } else {
+                                url
                             }
+                        } else {
+                            println!("Skipping {:?} url because it has no host. Is that even supposed to be possible?", url);
+                            continue;
+                        }
                     }
                 }
             } else {
