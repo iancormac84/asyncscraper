@@ -5,13 +5,16 @@ authors = ["iancormac84 <wilnathan@gmail.com>"]
 edition = "2018"
 
 [dependencies]
+bytes = "0.4.11"
 futures-preview = { version = "0.3.0-alpha.11", features = ["tokio-compat","compat"] }
-hyper = "0.12.19"
+hyper = "0.12.20"
 hyper-tls = "0.3"
 kuchiki = "0.7.2"
 mime = "0.3.12"
 mime_guess = { git = "https://github.com/abonander/mime_guess.git" }
 native-tls = "*"
-parking_lot = { path = "E:/Devel/resources/parking_lot" }
+#parking_lot = { path = "E:/Devel/resources/parking_lot" }
+probabilistic-collections = "0.5.0"
+slab = "0.4.1"
 tokio = { version = "0.1.13" }
 url = "1.7.2"

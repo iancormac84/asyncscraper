@@ -1,12 +1,17 @@
-#![feature(async_await, await_macro, futures_api, integer_atomics)]
+#![feature(
+    async_await,
+    await_macro,
+    futures_api,
+    generators,
+    gen_future,
+    integer_atomics
+)]
 
 use {
-    futures::{
-        channel::mpsc,
-        compat::Future01CompatExt,
-        future::{FutureExt, TryFutureExt},
-    },
+    bytes::Bytes,
+    futures::{channel::mpsc, compat::Future01CompatExt},
     hyper::{
+        self,
         client::{connect::dns::TokioThreadpoolGaiResolver, HttpConnector},
         header::CONTENT_TYPE,
         Body, Client, Request, Response,
@@ -15,10 +20,10 @@ use {
     kuchiki::traits::TendrilSink,
     mime::Mime,
     native_tls::TlsConnector,
-    parking_lot::Mutex,
+    probabilistic_collections::cuckoo::CuckooFilter,
+    slab::Slab,
     std::{
         collections::{HashSet, VecDeque},
-        future::Future,
         path::Path,
         pin::Pin,
         str,
@@ -35,21 +40,15 @@ use {
 type SClient = Client<HttpsConnector<HttpConnector<TokioThreadpoolGaiResolver>>>;
 
 pub struct UrlPool {
-    pool: Mutex<VecDeque<Url>>,
+    pool: VecDeque<Url>,
 }
 
 impl UrlPool {
-    pub fn add_urls(&self, urls: Vec<Url>) {
-        let mut acquired = self.pool.lock();
-        acquired.extend(urls);
+    pub fn add_urls(&mut self, urls: Vec<Url>) {
+        self.pool.extend(urls);
     }
-    fn try_get_url(&self) -> Result<Url, GetUrlError> {
-        let popped_url = match self.pool.try_lock() {
-            Some(mut pool) => pool.pop_front(),
-            None => return Err(GetUrlError::IsLocked),
-        };
-
-        match popped_url {
+    fn try_get_url(&mut self) -> Result<Url, GetUrlError> {
+        match self.pool.pop_front() {
             Some(url) => Ok(url),
             None => Err(GetUrlError::IsEmpty),
         }
@@ -57,163 +56,114 @@ impl UrlPool {
 }
 
 enum GetUrlError {
-    IsLocked,
     IsEmpty,
-    //IllFormattedUrl,
-    //IsClosed,
 }
 
 pub struct UrlStream {
-    source: Arc<UrlPool>,
-    inflight: Arc<AtomicU32>,
+    source: UrlPool,
+    inflight: AtomicU32, //TODO: Share this with other data structures? Probably should, because the seed URLs are put into the UrlPool...or should they be?
     waker: Option<Waker>,
 }
 
 impl futures::stream::Stream for UrlStream {
     type Item = Url;
 
-    fn poll_next(self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Option<Self::Item>> {
-        match self.source.try_get_url() {
-            Ok(url) => Poll::Ready(Some(url)),
-            Err(e) => match e {
-                GetUrlError::IsEmpty => {
-                    if self.inflight.load(Ordering::SeqCst) == 0 {
-                        Poll::Ready(None)
-                    } else {
-                        self.get_mut().waker = Some(lw.clone().into_waker());
-                        Poll::Pending
-                    }
-                }
-                GetUrlError::IsLocked => {
-                    self.get_mut().waker = Some(lw.clone().into_waker());
+    fn poll_next(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        match this.source.try_get_url() {
+            Ok(url) => {
+                this.inflight.fetch_add(1, Ordering::SeqCst);
+                Poll::Ready(Some(url))
+            }
+            Err(_) => {
+                if this.inflight.load(Ordering::SeqCst) == 0 {
+                    Poll::Ready(None)
+                } else {
+                    this.waker = Some(lw.clone().into_waker());
                     Poll::Pending
                 }
-            },
+            }
         }
     }
 }
 
-pub struct Orchestrator {
+pub struct CrawlResourcePool {
+    data: Slab<CrawlData>,
+    url_receiver: mpsc::UnboundedReceiver<CrawlData>,
+}
+
+pub struct CrawlData {
+    source: Arc<Url>,
+    data_type: Option<Mime>,
+    data: Bytes,
+}
+
+pub struct UrlStatus {
+    url: Arc<Url>,
+    error: hyper::error::Error,
+}
+
+async fn process_url(
+    url: Arc<Url>,
     client: Arc<SClient>,
-    to_visit: VecDeque<Url>,
-    visited: VecDeque<Url>,
-    inflight: Arc<AtomicU32>,
-    max_inflight: u32,
-    receiver: mpsc::UnboundedReceiver<HashSet<Url>>,
-    sender: mpsc::UnboundedSender<HashSet<Url>>,
-}
-
-impl Orchestrator {
-    pub fn new(urls: Vec<String>, max_inflight: u32) -> Orchestrator {
-        let (sender, receiver) = mpsc::unbounded();
-        Orchestrator {
-            client: {
-                let tls_connector = TlsConnector::new().unwrap();
-                let connector = HttpConnector::new_with_tokio_threadpool_resolver();
-                let mut connector = HttpsConnector::from((connector, tls_connector));
-                connector.https_only(false);
-                Arc::new(Client::builder().keep_alive(true).build(connector))
-            },
-            to_visit: urls.into_iter().map(|x| x.parse().unwrap()).collect(),
-            visited: VecDeque::new(),
-            inflight: Arc::new(AtomicU32::new(0)),
-            max_inflight,
-            sender,
-            receiver,
-        }
-    }
-}
-
-impl Future for Orchestrator {
-    type Output = ();
-    fn poll(self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Self::Output> {
-        if self.to_visit.is_empty() && self.inflight.load(Ordering::SeqCst) == 0 {
-            return Poll::Ready(());
-        }
-        while !self.to_visit.is_empty() && self.inflight.load(Ordering::SeqCst) < self.max_inflight
-        {
-            return Poll::Pending;
-        }
-        Poll::Pending
-    }
-}
-/*    pub async fn crawl_urls(&self) {
-    for url in self.to_visit {
-        let request = Request::builder()
+    crawl_data_sender: mpsc::UnboundedSender<CrawlData>,
+    url_status_sender: mpsc::UnboundedSender<UrlStatus>,
+) {
+    let req = Request::builder()
             .method("GET")
             .uri(&url[..])
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/71.0.3578.98 Safari/537.36")
             .body(Body::empty())
             .unwrap();
-        await!(self.process_request(request, url.clone()));
-        println!("Back at the top!");
-    }
-}
-
-async fn process_request(&self, req: Request<Body>, url: Url) {
-    let resp = await!(self.client.clone().request(req).compat()).unwrap();
-
+    let resp = {
+        match await!(client.clone().request(req).compat()) {
+            Ok(x) => x,
+            Err(error) => {
+                url_status_sender.unbounded_send(UrlStatus {
+                    url: url.clone(),
+                    error,
+                });
+                return;
+            }
+        }
+    };
     let headers = resp.headers();
-    //TODO: Do I need to determine the length? Maybe I can implement some
-    //optimizations having to do with polling priority? In other words, say I
-    //notice that a response has very little data. Maybe I could poll it more
-    //eagerly to get it out of the way so that I can free up more clients in the
-    //event that I have a limiter on the number of in-flight request/response pairs.
-    /*let data_length: Option<u64> = if let Some(cl) = headers.get(CONTENT_LENGTH).cloned() {
-        let num_str = cl.to_str();
-        if num_str.is_err() {
+    let data_type: Option<Mime> = if let Some(ct) = headers.get(CONTENT_TYPE).cloned() {
+        let mime_str = ct.to_str();
+        if mime_str.is_err() {
             None
         } else {
-            let num = num_str.unwrap().parse::<u64>();
-            if num.is_err() {
-                None
+            let mime = mime_str.unwrap().parse::<Mime>();
+            if mime.is_err() {
+                let ending = url.path_segments().unwrap();
+                let ending = ending.last().unwrap();
+                mime_guess::guess_mime_type_opt(Path::new(ending))
             } else {
-                Some(num.unwrap())
+                Some(mime.unwrap())
             }
         }
     } else {
         None
-    };*/
-let data_type: Option<Mime> = if let Some(ct) = headers.get(CONTENT_TYPE).cloned() {
-let mime_str = ct.to_str();
-if mime_str.is_err() {
-None
-} else {
-let mime = mime_str.unwrap().parse::<Mime>();
-if mime.is_err() {
-let ending = url.path_segments().unwrap();
-let ending = ending.last().unwrap();
-mime_guess::guess_mime_type_opt(Path::new(ending))
-} else {
-Some(mime.unwrap())
+    };
+    let data: Bytes = {
+        match await!(resp.into_body().concat2().compat()) {
+            Ok(x) => x.into(),
+            Err(error) => {
+                url_status_sender.unbounded_send(UrlStatus {
+                    url: url.clone(),
+                    error,
+                });
+                return;
+            }
+        }
+    };
+    let crawl_data = CrawlData {
+        source: url.clone(),
+        data_type,
+        data,
+    };
+    crawl_data_sender.unbounded_send(crawl_data);
 }
-}
-} else {
-None
-};
-if let Some(mime_ty) = data_type {
-if mime_ty.subtype() == mime::HTML {
-let scheme = url.scheme();
-let url_host_str = url.host_str().unwrap();
-let base_url = {
-if url_host_str.starts_with("//") {
-format!("{}:{}", scheme, url_host_str).parse().unwrap()
-} else {
-format!("{}://{}", scheme, url_host_str).parse().unwrap()
-}
-};
-tokio::spawn(|| {
-let searcher = UrlSearcher {
-crawl_url: url,
-base_url,
-data: resp,
-};
-
-});
-}
-}
-}
-}*/
 
 pub struct UrlSearcher {
     pub crawl_url: Url,
@@ -264,14 +214,4 @@ impl UrlSearcher {
     }
 }
 
-/*async fn fetch(urls: Vec<String>) {
-    let orchestrator = Orchestrator::new(urls);
-    let future = orchestrator.crawl_urls();
-    await!(future);
-}*/
-
-fn main() {
-    /*let future = fetch(vec!["http://eagantigua.org/page563.html".to_string()]);
-    let compat_future = future.boxed().unit_error().compat();
-    tokio::run(compat_future);*/
-}
+fn main() {}
