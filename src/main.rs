@@ -7,7 +7,7 @@ use {
         self,
         client::{connect::dns::TokioThreadpoolGaiResolver, HttpConnector},
         header::CONTENT_TYPE,
-        Body, Client, Request, StatusCode,
+        Body, Client, Request,
     },
     hyper_tls::HttpsConnector,
     kuchiki::traits::TendrilSink,
@@ -60,13 +60,13 @@ enum GetUrlError {
     IsEmpty,
 }
 
-struct Inner {
-    inflight: AtomicUsize,
+struct InflightUrls {
+    count: AtomicUsize,
 }
 
 struct UrlStream {
     source: UrlPool,
-    urls_in_flight: Arc<Inner>, //TODO: Share this with other data structures? Probably should, because the seed URLs are put into the UrlPool...or should they be?
+    urls_in_flight: Arc<InflightUrls>,
     waker: Option<Waker>,
     urls_to_add_receiver: mpsc::UnboundedReceiver<Urls>,
 }
@@ -75,7 +75,7 @@ impl UrlStream {
     pub fn new(
         seed: Vec<Url>,
         urls_to_add_receiver: mpsc::UnboundedReceiver<Urls>,
-        urls_in_flight: Arc<Inner>,
+        urls_in_flight: Arc<InflightUrls>,
     ) -> UrlStream {
         UrlStream {
             source: {
@@ -97,27 +97,30 @@ impl futures::stream::Stream for UrlStream {
         use crate::Urls::*;
         let this = &mut *self;
 
-        match this.source.try_get_url() {
-            Ok(url) => {
-                this.urls_in_flight.inflight.fetch_add(1, Ordering::SeqCst);
-                Poll::Ready(Some(url))
-            }
-            Err(_) => {
-                loop {
-                    match Pin::new(&mut this.urls_to_add_receiver).poll_next(lw) {
-                        Poll::Ready(Some(urls)) => match urls {
-                            One(url) => this.source.add_url(url),
-                            Multi(urls) => this.source.add_urls(urls),
-                        },
-                        Poll::Ready(None) => break,
-                        Poll::Pending => return Poll::Pending,
-                    }
+        loop {
+            match this.source.try_get_url() {
+                Ok(url) => {
+                    this.urls_in_flight.count.fetch_add(1, Ordering::SeqCst);
+                    return Poll::Ready(Some(url));
                 }
-                if this.urls_in_flight.inflight.load(Ordering::SeqCst) == 0 {
-                    Poll::Ready(None)
-                } else {
-                    this.waker = Some(lw.clone().into_waker());
-                    Poll::Pending
+                Err(_) => {
+                    loop {
+                        match Pin::new(&mut this.urls_to_add_receiver).poll_next(lw) {
+                            Poll::Ready(Some(urls)) => match urls {
+                                One(url) => this.source.add_url(url),
+                                Multi(urls) => this.source.add_urls(urls),
+                            },
+                            //Not sure if the line below is correct. My train of thought is that if the sender is finished, then it's time to do cleanup, so we jump out of the loop and either we end this stream also, or we add it to be polled. At this point, either we find URLs to stream, or we exit with a Poll::Ready(None) return.
+                            Poll::Ready(None) => break,
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    if this.urls_in_flight.count.load(Ordering::SeqCst) == 0 {
+                        return Poll::Ready(None);
+                    } else {
+                        this.waker = Some(lw.clone().into_waker());
+                        return Poll::Pending;
+                    }
                 }
             }
         }
@@ -206,11 +209,10 @@ pub struct CrawlData {
 pub struct UrlStatus {
     pub url: Arc<Url>,
     pub error: Option<hyper::error::Error>,
-    pub status_code: StatusCode,
 }
 
 pub struct UrlStatusHandler {
-    inner: Arc<Inner>,
+    inner: Arc<InflightUrls>,
     url_status_receiver: mpsc::UnboundedReceiver<UrlStatus>,
     extracted_urls_sender: mpsc::UnboundedSender<UrlOpt>,
 }
@@ -223,34 +225,29 @@ impl futures::stream::Stream for UrlStatusHandler {
         loop {
             match Pin::new(&mut this.url_status_receiver).poll_next(lw) {
                 Poll::Ready(Some(url_status)) => match url_status.error {
-                    Some(error) => match url_status.status_code.as_u16() {
-                        400..=599 => {
-                            println!(
-                                "Visit to {} was successful with a status code of {}.",
-                                &url_status.url[..],
-                                url.status_code.as_u16()
-                            );
-                            this.inner.inflight.fetch_sub(1, Ordering::SeqCst);
-                            if let Err(err) = this.extracted_urls_sender.unbounded_send(UrlOpt One {
-        url: url_status.url,
-        url_opt_source: UrlOptSource::UrlStatusHandler,
-    }) {
-                                if err.is_disconnected() {
-                                    panic!("URL status sender found disconnection error...ah wa de...!");
-                                } else if err.is_full() {
-                                    panic!("How yuh can be unbounded and be full???");
-                                }
+                    Some(error) => {
+                        println!(
+                            "Visit to {} was unsuccessful with error {}.",
+                            &url_status.url[..],
+                            error
+                        );
+                        this.inner.count.fetch_sub(1, Ordering::SeqCst);
+                        if let Err(err) = this.extracted_urls_sender.unbounded_send(UrlOpt::One {
+                            url: url_status.url,
+                            url_opt_source: UrlOptSource::UrlStatusHandler,
+                        }) {
+                            if err.is_disconnected() {
+                                panic!(
+                                    "URL status sender found disconnection error...ah wa de...!"
+                                );
+                            } else if err.is_full() {
+                                panic!("How yuh can be unbounded and be full???");
                             }
                         }
-                        _ => println!("Saw status code {}", url_status.status_code.as_u16()),
-                    },
+                    }
                     None => {
-                        println!(
-                            "Visit to {} was successful with a status code of {}.",
-                            &url_status.url[..],
-                            url.status_code.as_u16()
-                        );
-                        this.inner.inflight.fetch_sub(1, Ordering::SeqCst);
+                        println!("Visit to {} was successful.", &url_status.url[..]);
+                        this.inner.count.fetch_sub(1, Ordering::SeqCst);
                     }
                 },
                 Poll::Ready(None) => return Poll::Ready(None),
@@ -291,6 +288,7 @@ async fn process_url(
             }
         }
     };
+
     let headers = resp.headers();
     let data_type: Option<Mime> = if let Some(ct) = headers.get(CONTENT_TYPE).cloned() {
         let mime_str = ct.to_str();
@@ -407,7 +405,7 @@ async fn crawl_html(
 
 pub enum UrlOpt {
     One {
-        url: Url,
+        url: Arc<Url>,
         url_opt_source: UrlOptSource,
     },
     Set {
@@ -466,6 +464,7 @@ impl futures::stream::Stream for UrlFilter {
                                     //If it was from Crawler, check to see if it's already in the cuckoo filter, then go from there.
                                     UrlOptSource::Crawler => {
                                         if !this.filter.contains(&url) {
+                                            let url = Arc::try_unwrap(url).unwrap();
                                             Some(Urls::One(url))
                                         } else {
                                             None
@@ -525,8 +524,8 @@ impl Orchestrator {
         //extracted_urls_sender gets sent into crawl_html function. extracted_urls_receiver is inside UrlFilter.
         let (extracted_urls_sender, extracted_urls_receiver) = mpsc::unbounded::<UrlOpt>();
         let (url_status_sender, url_status_receiver) = mpsc::unbounded::<UrlStatus>();
-        let inner = Arc::new(Inner {
-            inflight: AtomicUsize::new(0),
+        let inner = Arc::new(InflightUrls {
+            count: AtomicUsize::new(0),
         });
         let url_stream = Arc::new(UrlStream::new(
             urls,
@@ -558,10 +557,18 @@ impl Orchestrator {
             url_status_sender,
         }
     }
-    pub fn run(&self) {
+    pub async fn crawl_urls(&self) {
         /*tokio::spawn_async(
             async move { await!(crawl_html(data, base_url, extracted_urls_sender.clone())) },
         );*/
+    }
+}
+
+impl std::future::Future for Orchestrator {
+    type Output = ();
+    fn poll(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Self::Output> {
+        let this = &mut *self;
+        while let Some(url) = await!(this.url_stream.poll_next(lw)) {}
     }
 }
 
