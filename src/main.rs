@@ -90,22 +90,20 @@ impl UrlStream {
     }
 }
 
-impl futures::stream::Stream for UrlStream {
-    type Item = Url;
-
-    fn poll_next(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Option<Self::Item>> {
+//TODO: Create the UrlStream inside the function so that it can be shielded?
+async fn stream_urls(url_pool: Arc<UrlPool>, urls_in_flight: Arc<InflightUrls>, urls_to_add_receiver: mpsc::UnboundedReceiver<Urls>) {
         use crate::Urls::*;
-        let this = &mut *self;
+        use futures::stream::StreamExt;
 
         loop {
-            match this.source.try_get_url() {
+            match url_pool.try_get_url() {
                 Ok(url) => {
-                    this.urls_in_flight.count.fetch_add(1, Ordering::SeqCst);
+                    urls_in_flight.count.fetch_add(1, Ordering::SeqCst);
                     return Poll::Ready(Some(url));
                 }
                 Err(_) => {
                     loop {
-                        match Pin::new(&mut this.urls_to_add_receiver).poll_next(lw) {
+                        while let Some(urls) = await!(urls_to_add_receiver.next()) {
                             Poll::Ready(Some(urls)) => match urls {
                                 One(url) => this.source.add_url(url),
                                 Multi(urls) => this.source.add_urls(urls),
@@ -561,14 +559,6 @@ impl Orchestrator {
         /*tokio::spawn_async(
             async move { await!(crawl_html(data, base_url, extracted_urls_sender.clone())) },
         );*/
-    }
-}
-
-impl std::future::Future for Orchestrator {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Self::Output> {
-        let this = &mut *self;
-        while let Some(url) = await!(this.url_stream.poll_next(lw)) {}
     }
 }
 
