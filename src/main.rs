@@ -13,6 +13,7 @@ use {
     kuchiki::traits::TendrilSink,
     mime::Mime,
     native_tls::TlsConnector,
+    pin_utils::pin_mut,
     probabilistic_collections::cuckoo::CuckooFilter,
     slab::Slab,
     std::{
@@ -212,7 +213,7 @@ pub struct UrlStatus {
 }
 
 pub struct UrlStatusHandler {
-    inner: Arc<InflightUrls>,
+    inflight_urls_counter: Arc<InflightUrls>,
     url_status_receiver: mpsc::UnboundedReceiver<UrlStatus>,
     extracted_urls_sender: mpsc::UnboundedSender<UrlOpt>,
 }
@@ -231,7 +232,9 @@ impl futures::stream::Stream for UrlStatusHandler {
                             &url_status.url[..],
                             error
                         );
-                        this.inner.count.fetch_sub(1, Ordering::SeqCst);
+                        this.inflight_urls_counter
+                            .count
+                            .fetch_sub(1, Ordering::SeqCst);
                         if let Err(err) = this.extracted_urls_sender.unbounded_send(UrlOpt::One {
                             url: url_status.url,
                             url_opt_source: UrlOptSource::UrlStatusHandler,
@@ -247,7 +250,9 @@ impl futures::stream::Stream for UrlStatusHandler {
                     }
                     None => {
                         println!("Visit to {} was successful.", &url_status.url[..]);
-                        this.inner.count.fetch_sub(1, Ordering::SeqCst);
+                        this.inflight_urls_counter
+                            .count
+                            .fetch_sub(1, Ordering::SeqCst);
                     }
                 },
                 Poll::Ready(None) => return Poll::Ready(None),
@@ -500,76 +505,52 @@ impl futures::stream::Stream for UrlFilter {
     }
 }
 
-pub struct Orchestrator {
-    client: Arc<SClient>,
-    url_resource_pool: Arc<UrlResourcePool>,
-    crawl_data_sender: mpsc::UnboundedSender<CrawlData>,
-    url_stream: Arc<UrlStream>,
-    url_filter: Arc<UrlFilter>,
-    extracted_urls_sender: mpsc::UnboundedSender<UrlOpt>,
-    url_status_handler: Arc<UrlStatusHandler>,
-    url_status_sender: mpsc::UnboundedSender<UrlStatus>,
-}
+pub async fn crawl_urls(urls: Vec<String>) {
+    use futures::stream::StreamExt;
 
-impl Orchestrator {
-    pub fn new(urls: Vec<String>) -> Orchestrator {
-        let urls = urls
-            .into_iter()
-            .map(|url| Url::parse(&url[..]).unwrap())
-            .collect();
-        //crawl_data_sender gets sent into process_url function. crawl_data_receiver is inside UrlResourcePool.
-        let (crawl_data_sender, crawl_data_receiver) = mpsc::unbounded::<CrawlData>();
-        //urls_for_pool_sender is sent into UrlFilter. urls_to_add_receiver is inside UrlStream. This setup is pretty much a single-producer single-consumer queue, because there is only one UrlFilter and one UrlStream. Is it possible to make more?
-        let (urls_for_pool_sender, urls_to_add_receiver) = mpsc::unbounded::<Urls>();
-        //extracted_urls_sender gets sent into crawl_html function. extracted_urls_receiver is inside UrlFilter.
-        let (extracted_urls_sender, extracted_urls_receiver) = mpsc::unbounded::<UrlOpt>();
-        let (url_status_sender, url_status_receiver) = mpsc::unbounded::<UrlStatus>();
-        let inner = Arc::new(InflightUrls {
-            count: AtomicUsize::new(0),
-        });
-        let url_stream = Arc::new(UrlStream::new(
-            urls,
-            urls_to_add_receiver,
-            Arc::clone(&inner),
-        ));
-        let url_status_handler = Arc::new(UrlStatusHandler {
-            inner,
-            url_status_receiver,
-            extracted_urls_sender: extracted_urls_sender.clone(),
-        });
-        Orchestrator {
-            client: {
-                let tls_connector = TlsConnector::new().unwrap();
-                let connector = HttpConnector::new_with_tokio_threadpool_resolver();
-                let mut connector = HttpsConnector::from((connector, tls_connector));
-                connector.https_only(false);
-                Arc::new(Client::builder().keep_alive(true).build(connector))
-            },
-            url_resource_pool: Arc::new(UrlResourcePool::new(crawl_data_receiver)),
-            crawl_data_sender,
-            url_stream,
-            url_filter: Arc::new(UrlFilter::new(
-                extracted_urls_receiver,
-                urls_for_pool_sender,
-            )),
-            extracted_urls_sender,
-            url_status_handler,
-            url_status_sender,
-        }
-    }
-    pub async fn crawl_urls(&self) {
-        /*tokio::spawn_async(
-            async move { await!(crawl_html(data, base_url, extracted_urls_sender.clone())) },
-        );*/
-    }
-}
+    let urls = urls
+        .into_iter()
+        .map(|url| Url::parse(&url[..]).unwrap())
+        .collect();
+    //crawl_data_sender gets sent into process_url function. crawl_data_receiver is inside UrlResourcePool.
+    let (crawl_data_sender, crawl_data_receiver) = mpsc::unbounded::<CrawlData>();
+    //urls_for_pool_sender is sent into UrlFilter. urls_to_add_receiver is inside UrlStream. This setup is pretty much a single-producer single-consumer queue, because there is only one UrlFilter and one UrlStream. Is it possible to make more?
+    let (urls_for_pool_sender, urls_to_add_receiver) = mpsc::unbounded::<Urls>();
+    //extracted_urls_sender gets sent into crawl_html function. extracted_urls_receiver is inside UrlFilter.
+    let (extracted_urls_sender, extracted_urls_receiver) = mpsc::unbounded::<UrlOpt>();
+    let (url_status_sender, url_status_receiver) = mpsc::unbounded::<UrlStatus>();
+    let inflight_urls_counter = Arc::new(InflightUrls {
+        count: AtomicUsize::new(0),
+    });
+    let url_stream = UrlStream::new(
+        urls,
+        urls_to_add_receiver,
+        Arc::clone(&inflight_urls_counter),
+    );
+    let url_status_handler = Arc::new(UrlStatusHandler {
+        inflight_urls_counter,
+        url_status_receiver,
+        extracted_urls_sender: extracted_urls_sender.clone(),
+    });
 
-impl std::future::Future for Orchestrator {
-    type Output = ();
-    fn poll(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Self::Output> {
-        let this = &mut *self;
-        while let Some(url) = await!(this.url_stream.poll_next(lw)) {}
-    }
+    let client: Arc<SClient> = {
+        let tls_connector = TlsConnector::new().unwrap();
+        let connector = HttpConnector::new_with_tokio_threadpool_resolver();
+        let mut connector = HttpsConnector::from((connector, tls_connector));
+        connector.https_only(false);
+        Arc::new(Client::builder().keep_alive(true).build(connector))
+    };
+    let url_resource_pool = Arc::new(UrlResourcePool::new(crawl_data_receiver));
+    let url_filter = Arc::new(UrlFilter::new(
+        extracted_urls_receiver,
+        urls_for_pool_sender,
+    ));
+
+    pin_mut!(url_stream);
+    while let Some(url) = await!(&mut url_stream.next()) {}
+    /*tokio::spawn_async(
+        async move { await!(crawl_html(data, base_url, extracted_urls_sender.clone())) },
+    );*/
 }
 
 fn main() {}
