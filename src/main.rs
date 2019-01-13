@@ -552,6 +552,7 @@ async fn crawl_html(
 ) {
     println!("Inside crawl_html().");
     let body = str::from_utf8(&url_payload.url_payload[..]).unwrap();
+    println!("body is {}", &body[..]);
     let parser = kuchiki::parse_html().one(&body[..]);
     let link_selector = parser.select("a").unwrap();
     let mut urls = HashSet::new();
