@@ -52,6 +52,9 @@ impl UrlPool {
     pub fn len(&self) -> usize {
         self.pool.len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.pool.is_empty()
+    }
     fn try_get_url(&mut self) -> Result<Url, GetUrlError> {
         match self.pool.pop_front() {
             Some(url) => Ok(url),
@@ -68,19 +71,23 @@ struct InflightUrls {
     count: AtomicUsize,
 }
 
-struct InflightPayloads {
+struct IncomingPayloads {
     count: AtomicUsize,
 }
 
-struct UrlPackets {
+struct IncomingUrlPackets {
+    count: AtomicUsize,
+}
+
+struct IncomingUrlStates {
     count: AtomicUsize,
 }
 
 struct UrlStream {
     source: UrlPool,
     urls_in_flight: Arc<InflightUrls>,
-    payloads_in_flight: Arc<InflightPayloads>,
-    incoming_url_packets: Arc<UrlPackets>,
+    incoming_payloads: Arc<IncomingPayloads>,
+    incoming_url_packets: Arc<IncomingUrlPackets>,
     waker: Option<Waker>,
     urls_to_add_receiver: mpsc::UnboundedReceiver<Urls>,
 }
@@ -90,19 +97,17 @@ impl UrlStream {
         seed: Vec<Url>,
         urls_to_add_receiver: mpsc::UnboundedReceiver<Urls>,
         urls_in_flight: Arc<InflightUrls>,
-        payloads_in_flight: Arc<InflightPayloads>,
-        incoming_url_packets: Arc<UrlPackets>,
+        incoming_payloads: Arc<IncomingPayloads>,
+        incoming_url_packets: Arc<IncomingUrlPackets>,
     ) -> UrlStream {
         UrlStream {
             source: {
                 let mut url_pool = UrlPool::new();
-                println!("url_pool.len() is {}.", url_pool.len());
                 url_pool.add_urls(seed);
-                println!("url_pool.len() is now {}.", url_pool.len());
                 url_pool
             },
             urls_in_flight,
-            payloads_in_flight,
+            incoming_payloads,
             waker: None,
             urls_to_add_receiver,
             incoming_url_packets,
@@ -123,57 +128,69 @@ impl futures::stream::Stream for UrlStream {
             this.source.len()
         );
 
-        if this.urls_in_flight.count.load(Ordering::SeqCst) == 0
-            && this.payloads_in_flight.count.load(Ordering::SeqCst) == 0
-            && this.source.try_get_url().is_err()
-        {
-            println!("Inside UrlStream, found that shit.");
-            return Poll::Ready(None);
-        } else if this.incoming_url_packets.count.load(Ordering::SeqCst) != 0 {
-            loop {
-                match Pin::new(&mut this.urls_to_add_receiver).poll_next(lw) {
-                    Poll::Ready(Some(urls)) => {
-                        this.incoming_url_packets
-                            .count
-                            .fetch_sub(1, Ordering::SeqCst);
-                        println!("Inside UrlStream, found Poll::Ready(Some({:?})), I guess we gon' loop again!", &urls);
-                        match urls {
-                            One(url) => this.source.add_url(url),
-                            Multi(urls) => this.source.add_urls(urls),
+        let (no_incoming_packets, no_urls_in_flight, no_incoming_payloads, source_is_empty) = (
+            this.incoming_url_packets.count.load(Ordering::SeqCst) == 0,
+            this.urls_in_flight.count.load(Ordering::SeqCst) == 0,
+            this.incoming_payloads.count.load(Ordering::SeqCst) == 0,
+            this.source.is_empty(),
+        );
+        println!(
+            "The quorum says {:?}",
+            (
+                no_incoming_packets,
+                no_urls_in_flight,
+                no_incoming_payloads,
+                source_is_empty
+            )
+        );
+
+        match (
+            no_incoming_packets,
+            no_urls_in_flight,
+            no_incoming_payloads,
+            source_is_empty,
+        ) {
+            (true, true, true, true) => {
+                println!("Inside UrlStream, found that shit.");
+                return Poll::Ready(None);
+            }
+            (true, false, true, true) | (true, true, false, true) | (true, false, false, true) => {
+                println!("Inside UrlStream, gonna just adopt a waker, and go to sleep.");
+                this.waker = Some(lw.clone().into_waker());
+                return Poll::Pending;
+            }
+            _ => {
+                if !no_incoming_packets {
+                    println!("We got some incoming packets!");
+                    loop {
+                        match Pin::new(&mut this.urls_to_add_receiver).poll_next(lw) {
+                            Poll::Ready(Some(urls)) => {
+                                this.incoming_url_packets
+                                    .count
+                                    .fetch_sub(1, Ordering::SeqCst);
+                                println!("Inside UrlStream, found Poll::Ready(Some({:?})), I guess we gon' loop again!", &urls);
+                                match urls {
+                                    One(url) => this.source.add_url(url),
+                                    Multi(urls) => this.source.add_urls(urls),
+                                }
+                            }
+                            Poll::Ready(None) | Poll::Pending => {
+                                this.waker = Some(lw.clone().into_waker());
+                                println!("Inside UrlStream, found Poll::Pending or Poll::Ready(None), about to break.");
+                                break;
+                            }
                         }
                     }
-                    Poll::Ready(None) | Poll::Pending => {
-                        this.waker = Some(lw.clone().into_waker());
-                        println!("Inside UrlStream, found Poll::Pending or Poll::Ready(None), about to break.");
-                        break;
+                }
+                println!("About to try to get a URL now.");
+                println!("this.source.len() is {} at this stage.", this.source.len());
+                match this.source.try_get_url() {
+                    Ok(url) => {
+                        this.urls_in_flight.count.fetch_add(1, Ordering::SeqCst);
+                        println!("About to return Poll::Ready(Some({})).", &url[..]);
+                        return Poll::Ready(Some(url));
                     }
-                }
-            }
-            match this.source.try_get_url() {
-                Ok(url) => {
-                    this.urls_in_flight.count.fetch_add(1, Ordering::SeqCst);
-                    println!("About to return Poll::Ready(Some({})).", &url[..]);
-                    return Poll::Ready(Some(url));
-                }
-                Err(_) => panic!("This shouldn't happen! We should have URLs to process!"),
-            }
-        } else {
-            println!("this.source.len() is {}", this.source.len());
-            match this.source.try_get_url() {
-                Ok(url) => {
-                    this.urls_in_flight.count.fetch_add(1, Ordering::SeqCst);
-                    println!("About to return Poll::Ready(Some({})).", &url[..]);
-                    return Poll::Ready(Some(url));
-                }
-                Err(_) => {
-                    if this.urls_in_flight.count.load(Ordering::SeqCst) == 0 {
-                        println!("Inside UrlStream, about to return Poll::Ready(None) after finding that there are no in-flight URLs.");
-                        return Poll::Ready(None);
-                    } else {
-                        println!("Inside UrlStream, about to return Poll::Pending, because there are in-flight URLs, but no incoming URLs at the moment.");
-                        this.waker = Some(lw.clone().into_waker());
-                        return Poll::Pending;
-                    }
+                    Err(_) => panic!("This shouldn't happen! We should have URLs to process!"),
                 }
             }
         }
@@ -192,25 +209,25 @@ pub enum Data {
 }
 
 struct UrlPayloadPool {
-    pub url_payload_pool: Slab<UrlPayload>,
-    pub url_payload_receiver: mpsc::UnboundedReceiver<UrlPayload>,
+    url_payload_pool: Slab<UrlPayload>,
+    url_payload_receiver: mpsc::UnboundedReceiver<UrlPayload>,
     waker: Option<Waker>,
     urls_in_flight: Arc<InflightUrls>,
-    payloads_in_flight: Arc<InflightPayloads>,
+    incoming_payloads: Arc<IncomingPayloads>,
 }
 
 impl UrlPayloadPool {
     pub fn new(
         url_payload_receiver: mpsc::UnboundedReceiver<UrlPayload>,
         urls_in_flight: Arc<InflightUrls>,
-        payloads_in_flight: Arc<InflightPayloads>,
+        incoming_payloads: Arc<IncomingPayloads>,
     ) -> UrlPayloadPool {
         Self {
             url_payload_pool: Slab::new(),
             url_payload_receiver,
             waker: None,
             urls_in_flight,
-            payloads_in_flight,
+            incoming_payloads,
         }
     }
 }
@@ -218,70 +235,45 @@ impl UrlPayloadPool {
 impl futures::stream::Stream for UrlPayloadPool {
     type Item = Data;
 
-    //TODO: When you reach back home, you have to rewrite this method so that it returns more granular Poll variants.
-    //urls == 0 && payloads == 0 && payload_pool == 0 -> Poll::Ready(None)
-    //urls == 0 && payloads != 0 -> pull from payload_receiver until it returns Poll::Pending (or Poll::Ready(None)?)
-    //following from above option, payloads should be 0, but payload_pool != 0
     fn poll_next(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Option<Self::Item>> {
         println!("Inside UrlPayloadPool.");
         let this = &mut *self;
-        if this.urls_in_flight.count.load(Ordering::SeqCst) == 0
-            && this.payloads_in_flight.count.load(Ordering::SeqCst) == 0
-            && this.url_payload_pool.is_empty()
-        {
-            return Poll::Ready(None);
-        } else if this.payloads_in_flight.count.load(Ordering::SeqCst) != 0 {
-            //This condition should cover when payload pool is empty or not. It can be filled, because there are some payloads incoming through the channel.
-            loop {
-                println!("Inside inner loop of UrlPayloadPool.");
-                match Pin::new(&mut this.url_payload_receiver).poll_next(lw) {
-                    Poll::Ready(Some(url_payload)) => {
-                        println!("Inserting url_payload.");
-                        this.url_payload_pool.insert(url_payload);
-                        this.payloads_in_flight.count.fetch_sub(1, Ordering::SeqCst);
-                    }
-                    Poll::Ready(None) | Poll::Pending => {
-                        println!(
-                            "Inside inner loop of UrlPayloadPool, breaking out of inner loop."
-                        );
-                        break;
-                    }
-                };
-            }
-            let url_payload = this.url_payload_pool.remove(0);
-            let scheme = url_payload.source.scheme();
-            let url_host_str = url_payload.source.host_str().unwrap();
-            let base_url: Url = {
-                if url_host_str.starts_with("//") {
-                    format!("{}:{}", scheme, url_host_str).parse().unwrap()
-                } else {
-                    format!("{}://{}", scheme, url_host_str).parse().unwrap()
-                }
-            };
-            println!("base_url is {}", &base_url[..]);
-            if let Some(ref mime_ty) = url_payload.url_payload_type {
-                if mime_ty.subtype() == mime::HTML {
-                    return Poll::Ready(Some(Data::Html {
-                        url_payload,
-                        base_url,
-                    }));
-                } else {
-                    return Poll::Ready(Some(Data::Other {
-                        url_payload,
-                        base_url,
-                    }));
-                }
-            } else {
-                return Poll::Ready(Some(Data::Other {
-                    url_payload,
-                    base_url,
-                }));
-            }
-        } else {
-            if this.url_payload_pool.is_empty() {
+
+        let (no_urls_in_flight, no_incoming_payloads, is_url_payload_pool_empty) = (
+            this.urls_in_flight.count.load(Ordering::SeqCst) == 0,
+            this.incoming_payloads.count.load(Ordering::SeqCst) == 0,
+            this.url_payload_pool.is_empty(),
+        );
+        match (
+            no_urls_in_flight,
+            no_incoming_payloads,
+            is_url_payload_pool_empty,
+        ) {
+            (true, true, true) => return Poll::Ready(None),
+            (false, true, true) => {
                 this.waker = Some(lw.clone().into_waker());
                 return Poll::Pending;
-            } else {
+            }
+            _ => {
+                if !no_incoming_payloads {
+                    loop {
+                        println!("Inside inner loop of UrlPayloadPool.");
+                        match Pin::new(&mut this.url_payload_receiver).poll_next(lw) {
+                            Poll::Ready(Some(url_payload)) => {
+                                println!("Inserting url_payload.");
+                                this.url_payload_pool.insert(url_payload);
+                                this.incoming_payloads.count.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            Poll::Ready(None) | Poll::Pending => {
+                                this.waker = Some(lw.clone().into_waker());
+                                println!(
+                                "Inside inner loop of UrlPayloadPool, breaking out of inner loop."
+                            );
+                                break;
+                            }
+                        };
+                    }
+                }
                 let url_payload = this.url_payload_pool.remove(0);
                 let scheme = url_payload.source.scheme();
                 let url_host_str = url_payload.source.host_str().unwrap();
@@ -322,70 +314,130 @@ pub struct UrlPayload {
     pub url_payload: Bytes,
 }
 
-pub struct UrlStatus {
+pub struct UrlState {
     pub url: Arc<Url>,
     pub error: Option<hyper::error::Error>,
 }
 
-pub struct UrlStatusHandler {
+pub struct UrlStateHandler {
     urls_in_flight: Arc<InflightUrls>,
-    url_status_receiver: mpsc::UnboundedReceiver<UrlStatus>,
+    incoming_url_states: Arc<IncomingUrlStates>,
+    url_state_receiver: mpsc::UnboundedReceiver<UrlState>,
     extracted_urls_sender: Arc<mpsc::UnboundedSender<UrlOpt>>,
+    waker: Option<Waker>,
+    url_states_pool: Slab<UrlState>,
 }
 
-impl futures::stream::Stream for UrlStatusHandler {
+impl futures::stream::Stream for UrlStateHandler {
     type Item = ();
 
     fn poll_next(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Option<Self::Item>> {
-        println!("Inside UrlStatusHandler.");
+        println!("Inside UrlStateHandler.");
         let this = &mut *self;
-        loop {
-            match Pin::new(&mut this.url_status_receiver).poll_next(lw) {
-                Poll::Ready(Some(url_status)) => match url_status.error {
-                    Some(error) => {
+
+        let (no_urls_in_flight, no_incoming_url_states, url_states_pool_is_empty) = (
+            this.urls_in_flight.count.load(Ordering::SeqCst) == 0,
+            this.incoming_url_states.count.load(Ordering::SeqCst) == 0,
+            this.url_states_pool.is_empty(),
+        );
+
+        match (
+            no_urls_in_flight,
+            no_incoming_url_states,
+            url_states_pool_is_empty,
+        ) {
+            (true, true, true) => return Poll::Ready(None),
+            (false, true, true) => {
+                this.waker = Some(lw.clone().into_waker());
+                return Poll::Pending;
+            }
+            _ => {
+                if !no_incoming_url_states {
+                    loop {
+                        match Pin::new(&mut this.url_state_receiver).poll_next(lw) {
+                            Poll::Ready(Some(url_state)) => {
+                                this.url_states_pool.insert(url_state);
+                                this.incoming_url_states
+                                    .count
+                                    .fetch_sub(1, Ordering::SeqCst);
+                                this.urls_in_flight.count.fetch_sub(1, Ordering::SeqCst);
+                            }
+                            Poll::Ready(None) | Poll::Pending => {
+                                this.waker = Some(lw.clone().into_waker());
+                                println!(
+                                "Inside inner loop of UrlStateHandler, breaking out of inner loop."
+                            );
+                                break;
+                            }
+                        }
+                    }
+                }
+                let url_state = this.url_states_pool.remove(0);
+                match url_state.error {
+                    Some(ref error) => {
                         println!(
                             "Visit to {} was unsuccessful with error {}.",
-                            &url_status.url[..],
+                            &url_state.url[..],
                             error
                         );
-                        println!("Inside UrlStatusHandler, about to decrement the number of inflight URLs by 1.");
-                        this.urls_in_flight.count.fetch_sub(1, Ordering::SeqCst);
-                        if let Err(err) = this.extracted_urls_sender.unbounded_send(UrlOpt::One {
-                            url: url_status.url,
-                            url_opt_source: UrlOptSource::UrlStatusHandler,
-                        }) {
-                            if err.is_disconnected() {
-                                panic!(
-                                    "URL status sender found disconnection error...ah wa de...!"
-                                );
-                            } else if err.is_full() {
-                                panic!("How yuh can be unbounded and be full???");
+                        //<---- When I start to actually sift through errors to determine what URLs could be retried, this will become relevant again.
+                        //println!("Inside UrlStateHandler, about to decrement the number of inflight URLs by 1.");
+                        //this.urls_in_flight.count.fetch_sub(1, Ordering::SeqCst);
+                        let message = UrlOpt::One {
+                            url: Arc::clone(&url_state.url),
+                            url_opt_source: UrlOptSource::UrlStateHandler,
+                        };
+                        match this.extracted_urls_sender.unbounded_send(message) {
+                            Err(err) => {
+                                if err.is_disconnected() {
+                                    panic!("URL status sender found disconnection error...ah wa de...!");
+                                } else if err.is_full() {
+                                    this.url_states_pool.insert(url_state);
+                                    this.waker = Some(lw.clone().into_waker());
+                                    //Because there's URL states to be sent, dammit! We can discard the message because we will recreate it when the url_state comes back around for processing.
+                                    return Poll::Pending;
+                                } else {
+                                    unreachable!("You have reached a unicorn error!");
+                                }
+                            }
+                            Ok(()) => {
+                                if this.urls_in_flight.count.load(Ordering::SeqCst) != 0 {
+                                    this.waker = Some(lw.clone().into_waker());
+                                    return Poll::Pending;
+                                } else {
+                                    return Poll::Ready(None);
+                                }
                             }
                         }
                     }
                     None => {
-                        println!("Visit to {} was successful.", &url_status.url[..]);
-                        println!("Inside UrlStatusHandler, after finding no errors, about to decrement the number of inflight URLs by 1.");
+                        println!("Visit to {} was successful.", &url_state.url[..]);
+                        if this.urls_in_flight.count.load(Ordering::SeqCst) != 0 {
+                            this.waker = Some(lw.clone().into_waker());
+                            return Poll::Pending;
+                        } else {
+                            return Poll::Ready(None);
+                        }
+                        /*println!("Inside UrlStateHandler, after finding no errors, about to decrement the number of inflight URLs by 1.");
                         this.urls_in_flight.count.fetch_sub(1, Ordering::SeqCst);
                         println!(
                             "Number of in-flight URLs is now {}",
                             this.urls_in_flight.count.load(Ordering::SeqCst)
-                        );
+                        );*/
                     }
-                },
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
+                }
             }
         }
     }
 }
 
 async fn process_url(
-    payloads_in_flight: Arc<InflightPayloads>,
+    incoming_payloads: Arc<IncomingPayloads>,
     url: Arc<Url>,
     client: Arc<SClient>,
     url_payload_sender: mpsc::UnboundedSender<UrlPayload>,
-    url_status_sender: mpsc::UnboundedSender<UrlStatus>,
+    url_state_sender: mpsc::UnboundedSender<UrlState>,
+    incoming_url_states_counter: Arc<IncomingUrlStates>,
 ) {
     println!("Inside process_url().");
     let req = Request::builder()
@@ -394,21 +446,25 @@ async fn process_url(
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/71.0.3578.98 Safari/537.36")
             .body(Body::empty())
             .unwrap();
+    println!("Made my request!");
     let resp = {
         match await!(client.clone().request(req).compat()) {
             Ok(x) => x,
             Err(error) => {
-                let url_status = UrlStatus {
+                let url_state = UrlState {
                     url: url.clone(),
                     error: Some(error),
                 };
-                if let Err(err) = url_status_sender.unbounded_send(url_status) {
+                if let Err(err) = url_state_sender.unbounded_send(url_state) {
                     if err.is_disconnected() {
                         panic!("URL status sender found disconnection error...ah wa de...!");
                     } else if err.is_full() {
                         panic!("How yuh can be unbounded and be full???");
                     }
                 }
+                incoming_url_states_counter
+                    .count
+                    .fetch_add(1, Ordering::SeqCst);
                 return;
             }
         }
@@ -435,31 +491,37 @@ async fn process_url(
     let url_payload: Bytes = {
         match await!(resp.into_body().concat2().compat()) {
             Ok(x) => {
-                let url_status = UrlStatus {
+                let url_state = UrlState {
                     url: url.clone(),
                     error: None,
                 };
-                if let Err(err) = url_status_sender.unbounded_send(url_status) {
+                if let Err(err) = url_state_sender.unbounded_send(url_state) {
                     if err.is_disconnected() {
                         panic!("URL status sender found disconnection error...ah wa de...!");
                     } else if err.is_full() {
                         panic!("How yuh can be unbounded and be full???");
                     }
                 }
+                incoming_url_states_counter
+                    .count
+                    .fetch_add(1, Ordering::SeqCst);
                 x.into()
             }
             Err(error) => {
-                let url_status = UrlStatus {
+                let url_state = UrlState {
                     url: url.clone(),
                     error: Some(error),
                 };
-                if let Err(err) = url_status_sender.unbounded_send(url_status) {
+                if let Err(err) = url_state_sender.unbounded_send(url_state) {
                     if err.is_disconnected() {
                         panic!("URL status sender found disconnection error...ah wa de...!");
                     } else if err.is_full() {
                         panic!("How yuh can be unbounded and be full???");
                     }
                 }
+                incoming_url_states_counter
+                    .count
+                    .fetch_add(1, Ordering::SeqCst);
                 return;
             }
         }
@@ -476,7 +538,10 @@ async fn process_url(
             panic!("How yuh can be unbounded and be full???");
         }
     } else {
-        payloads_in_flight.count.fetch_add(1, Ordering::SeqCst);
+        incoming_payloads.count.fetch_add(1, Ordering::SeqCst);
+        incoming_url_states_counter
+            .count
+            .fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -544,7 +609,7 @@ pub enum UrlOpt {
 
 #[derive(Clone, Debug)]
 pub enum UrlOptSource {
-    UrlStatusHandler,
+    UrlStateHandler,
     Crawler,
 }
 
@@ -558,20 +623,22 @@ struct UrlFilter {
     filter: CuckooFilter<Url>,
     extracted_urls_receiver: mpsc::UnboundedReceiver<UrlOpt>,
     urls_for_pool_sender: mpsc::UnboundedSender<Urls>,
-    url_packets: Arc<UrlPackets>,
+    url_packets: Arc<IncomingUrlPackets>,
+    waker: Option<Waker>,
 }
 
 impl UrlFilter {
     pub fn new(
         extracted_urls_receiver: mpsc::UnboundedReceiver<UrlOpt>,
         urls_for_pool_sender: mpsc::UnboundedSender<Urls>,
-        url_packets: Arc<UrlPackets>,
+        url_packets: Arc<IncomingUrlPackets>,
     ) -> UrlFilter {
         Self {
             filter: CuckooFilter::<Url>::from_entries_per_index(100, 0.01, 8),
             extracted_urls_receiver,
             urls_for_pool_sender,
             url_packets,
+            waker: None,
         }
     }
 }
@@ -581,56 +648,57 @@ impl futures::stream::Stream for UrlFilter {
     fn poll_next(mut self: Pin<&mut Self>, lw: &LocalWaker) -> Poll<Option<Self::Item>> {
         println!("Inside UrlFilter.");
         let this = &mut *self;
-        loop {
-            match Pin::new(&mut this.extracted_urls_receiver).poll_next(lw) {
-                Poll::Ready(Some(urls)) => {
-                    let maybe_urls = {
-                        match urls {
-                            UrlOpt::One {
-                                url,
-                                url_opt_source,
-                            } => {
-                                match url_opt_source {
-                                    //If it was from UrlStatusHandler, it's to be put into the cuckoo filter to signify that is has been crawled.
-                                    UrlOptSource::UrlStatusHandler => {
-                                        this.filter.insert(&url);
+
+        match Pin::new(&mut this.extracted_urls_receiver).poll_next(lw) {
+            Poll::Ready(Some(urls)) => {
+                let maybe_urls = {
+                    match urls {
+                        UrlOpt::One {
+                            url,
+                            url_opt_source,
+                        } => {
+                            match url_opt_source {
+                                //If it was from UrlStateHandler, it's to be put into the cuckoo filter to signify that is has been crawled.
+                                UrlOptSource::UrlStateHandler => {
+                                    this.filter.insert(&url);
+                                    None
+                                }
+                                //If it was from Crawler, check to see if it's already in the cuckoo filter, then go from there.
+                                UrlOptSource::Crawler => {
+                                    if !this.filter.contains(&url) {
+                                        let url = Arc::try_unwrap(url).unwrap();
+                                        Some(Urls::One(url))
+                                    } else {
                                         None
-                                    }
-                                    //If it was from Crawler, check to see if it's already in the cuckoo filter, then go from there.
-                                    UrlOptSource::Crawler => {
-                                        if !this.filter.contains(&url) {
-                                            let url = Arc::try_unwrap(url).unwrap();
-                                            Some(Urls::One(url))
-                                        } else {
-                                            None
-                                        }
                                     }
                                 }
                             }
-                            UrlOpt::Set { mut urls } => {
-                                urls.retain(|url| !this.filter.contains(&url));
-                                Some(Urls::Multi(urls.into_iter().collect()))
-                            }
                         }
-                    };
-                    if let Some(urls) = maybe_urls {
-                        if let Err(err) = this.urls_for_pool_sender.unbounded_send(urls) {
-                            if err.is_disconnected() {
-                                panic!(
-                                    "urls_for_pool_sender found disconnection error...ah wa de...!"
-                                );
-                            } else if err.is_full() {
-                                panic!("How yuh can be unbounded and be full???");
-                            }
+                        UrlOpt::Set { mut urls } => {
+                            urls.retain(|url| !this.filter.contains(&url));
+                            Some(Urls::Multi(urls.into_iter().collect()))
                         }
-                        this.url_packets.count.fetch_add(1, Ordering::SeqCst);
-                        return Poll::Ready(Some(()));
-                    } else {
-                        return Poll::Pending;
                     }
+                };
+                if let Some(urls) = maybe_urls {
+                    if let Err(err) = this.urls_for_pool_sender.unbounded_send(urls) {
+                        if err.is_disconnected() {
+                            panic!("urls_for_pool_sender found disconnection error...ah wa de...!");
+                        } else if err.is_full() {
+                            panic!("How yuh can be unbounded and be full???");
+                        }
+                    }
+                    this.url_packets.count.fetch_add(1, Ordering::SeqCst);
+                    return Poll::Ready(Some(()));
+                } else {
+                    this.waker = Some(lw.clone().into_waker());
+                    return Poll::Pending;
                 }
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
+            }
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => {
+                this.waker = Some(lw.clone().into_waker());
+                return Poll::Pending;
             }
         }
     }
@@ -660,22 +728,25 @@ pub async fn crawl_urls(urls: Vec<String>) {
     //extracted_urls_sender gets sent into crawl_html function. extracted_urls_receiver is inside UrlFilter.
     let (extracted_urls_sender, extracted_urls_receiver) = mpsc::unbounded::<UrlOpt>();
     let extracted_urls_sender = Arc::new(extracted_urls_sender);
-    let (url_status_sender, url_status_receiver) = mpsc::unbounded::<UrlStatus>();
+    let (url_state_sender, url_state_receiver) = mpsc::unbounded::<UrlState>();
 
     let urls_in_flight = Arc::new(InflightUrls {
         count: AtomicUsize::new(0),
     });
-    let payloads_in_flight = Arc::new(InflightPayloads {
+    let incoming_payloads = Arc::new(IncomingPayloads {
         count: AtomicUsize::new(0),
     });
-    let incoming_url_packets = Arc::new(UrlPackets {
+    let incoming_url_packets = Arc::new(IncomingUrlPackets {
+        count: AtomicUsize::new(0),
+    });
+    let incoming_url_states = Arc::new(IncomingUrlStates {
         count: AtomicUsize::new(0),
     });
     let mut url_stream = UrlStream::new(
         urls,
         urls_to_add_receiver,
         Arc::clone(&urls_in_flight),
-        Arc::clone(&payloads_in_flight),
+        Arc::clone(&incoming_payloads),
         Arc::clone(&incoming_url_packets),
     );
 
@@ -692,27 +763,31 @@ pub async fn crawl_urls(urls: Vec<String>) {
     );
 
     let urls_in_flight1 = Arc::clone(&urls_in_flight);
-    let mut url_status_handler = UrlStatusHandler {
+    let incoming_url_states1 = Arc::clone(&incoming_url_states);
+    let mut url_state_handler = UrlStateHandler {
         urls_in_flight: Arc::clone(&urls_in_flight1),
-        url_status_receiver,
+        incoming_url_states: Arc::clone(&incoming_url_states1),
+        url_state_receiver,
         extracted_urls_sender: Arc::clone(&extracted_urls_sender),
+        waker: None,
+        url_states_pool: Slab::new(),
     };
 
-    tokio_spawn(async move { while let Some(()) = await!(url_status_handler.next()) {} });
+    tokio_spawn(async move { while let Some(()) = await!(url_state_handler.next()) {} });
 
-    let payloads_in_flight1 = Arc::clone(&payloads_in_flight);
-    let payloads_in_flight2 = Arc::clone(&payloads_in_flight1);
+    let incoming_payloads1 = Arc::clone(&incoming_payloads);
+    let incoming_payloads2 = Arc::clone(&incoming_payloads);
+    let urls_in_flight2 = Arc::clone(&urls_in_flight1);
+    let extracted_urls_sender1 = Arc::clone(&extracted_urls_sender);
+    let extracted_urls_sender2 = Arc::clone(&extracted_urls_sender1);
     tokio_spawn(
         async move {
-            let url_payload_pool = UrlPayloadPool::new(
-                url_payload_receiver,
-                Arc::clone(&urls_in_flight1),
-                payloads_in_flight2,
-            );
+            let url_payload_pool =
+                UrlPayloadPool::new(url_payload_receiver, urls_in_flight2, incoming_payloads2);
             pin_mut!(url_payload_pool);
-            let extracted_urls_sender1 = Arc::clone(&extracted_urls_sender);
+            let extracted_urls_sender3 = Arc::clone(&extracted_urls_sender2);
             while let Some(url_payload) = await!(url_payload_pool.next()) {
-                let extracted_urls_sender2 = Arc::clone(&extracted_urls_sender1);
+                let extracted_urls_sender4 = Arc::clone(&extracted_urls_sender3);
                 tokio_spawn(
                     async move {
                         if let Data::Html {
@@ -720,7 +795,7 @@ pub async fn crawl_urls(urls: Vec<String>) {
                             base_url,
                         } = url_payload
                         {
-                            await!(crawl_html(url_payload, base_url, extracted_urls_sender2));
+                            await!(crawl_html(url_payload, base_url, extracted_urls_sender4));
                         }
                     },
                 );
@@ -730,18 +805,21 @@ pub async fn crawl_urls(urls: Vec<String>) {
 
     //pin_mut!(url_stream);
     while let Some(url) = await!(url_stream.next()) {
-        let client_clone = client.clone();
-        let url_payload_sender_clone = url_payload_sender.clone();
-        let url_status_sender_clone = url_status_sender.clone();
-        let payloads_in_flight2 = Arc::clone(&payloads_in_flight1);
+        println!("Got an URL {:?} inside the async while loop.", url);
+        let client1 = client.clone();
+        let url_payload_sender1 = url_payload_sender.clone();
+        let url_state_sender1 = url_state_sender.clone();
+        let incoming_payloads2 = Arc::clone(&incoming_payloads1);
+        let incoming_url_states_counter = Arc::clone(&incoming_url_states1);
         tokio_spawn(
             async {
                 await!(process_url(
-                    payloads_in_flight2,
+                    incoming_payloads2,
                     Arc::new(url),
-                    client_clone,
-                    url_payload_sender_clone,
-                    url_status_sender_clone
+                    client1,
+                    url_payload_sender1,
+                    url_state_sender1,
+                    incoming_url_states_counter
                 ))
             },
         );
